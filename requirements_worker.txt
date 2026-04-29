@@ -1,0 +1,7 @@
+# Jetson worker nodes — install into a venv created with --system-site-packages
+# so that JetPack's pre-built torch/CUDA is inherited. Do NOT pip install torch here.
+ray[default]>=2.9.0,<3.0.0
+ultralytics>=8.0.0
+rtmlib>=0.0.13
+pyyaml>=6.0
+pynvml>=11.0.0

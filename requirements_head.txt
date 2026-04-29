@@ -1,0 +1,5 @@
+# GPU PC head node — activate .venv_mmpose first, then pip install this file.
+# torch, ultralytics, mmpose, mmdet, opencv are already in .venv_mmpose.
+ray[default]>=2.9.0,<3.0.0
+pyyaml>=6.0
+pynvml>=11.0.0
