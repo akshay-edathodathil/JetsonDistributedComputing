@@ -1,0 +1,16 @@
+video:              /home/nvidia/session_videos/Elm_Jok_manual_1_117_20250708170005_1min.mp4
+output_csv:         /home/nvidia/JetsonDistributedComp/results/Elm_Jok_manual_1_117_20250708170005_1min_results.csv
+frames_processed:   300
+total_frames:       300
+total_detections:   592
+avg_detections_per_frame: 1.97
+
+total_time:         00h 01m 14.64s  (74.6s)
+processing_fps:     4.02
+
+avg_det_ms:         176.6
+avg_pose_ms:        8.6
+avg_id_ms:          23.8
+avg_total_ms_per_frame: 208.9
+
+interrupted:        no

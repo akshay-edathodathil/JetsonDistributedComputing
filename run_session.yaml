@@ -1,0 +1,152 @@
+---
+# run_session.yaml — Distribute videos, run inference on all Jetsons, collect results.
+#
+# Edit `video_assignments` below to point each Jetson at the correct video file.
+# All 4 Jetsons run in parallel. Results are pulled back to `local_results_dir`.
+#
+# Run with:
+#   ansible-playbook -i inventory.yaml run_session.yaml
+#   ansible-playbook -i inventory.yaml run_session.yaml --limit j001   # single Jetson test
+
+- name: Run monkey detection + pose + ID pipeline on all Jetsons
+  hosts: jetsons
+  gather_facts: false
+
+  vars:
+    # ── Edit these paths before each session run ────────────────────────────
+    video_assignments:
+      j001: "/home/cams/Desktop/Akshay/multi_camera_test_videos/Elm_Jok_manual_1_117_20250708170005_1min.mp4"
+      j002: "/home/cams/Desktop/Akshay/multi_camera_test_videos/Elm_Jok_manual_1_108_20250708170005_1min.mp4"
+      j003: "/home/cams/Desktop/Akshay/multi_camera_test_videos/Elm_Jok_manual_1_102_20250708170005_1min.mp4"
+      j004: "/home/cams/Desktop/Akshay/multi_camera_test_videos/Elm_Jok_manual_1_113_20250708170005_1min.mp4"
+
+    # ── Paths (usually no need to change) ───────────────────────────────────
+    project_dir: "/home/nvidia/JetsonDistributedComp"
+    models_dir:  "/home/nvidia/JetsonDistributedComp/converted_models"
+    remote_video_dir: "/home/nvidia/session_videos"
+    remote_results_dir: "/home/nvidia/JetsonDistributedComp/results"
+    local_results_dir:  "/home/cams/Desktop/Akshay/JetsonDistributedComp/results"
+
+    rtdetr_model:  "{{ models_dir }}/RT-DETR_640.pt"
+    rtmpose_model: "{{ models_dir }}/rtmpose_homecage_best_size256.onnx"
+    id_model:      "{{ models_dir }}/ID_model_ElmJok_Apr2026.onnx"
+
+    # Pipeline settings
+    detection_conf: "0.5"
+    skip_frames: "1"           # 1=every frame, 2=every other frame, etc.
+    rtmpose_input_size: "256,256"
+    monkey_names: "Elm,Jok"
+
+    # Derived per-host values
+    _video_src: "{{ video_assignments[inventory_hostname] }}"
+    _video_name: "{{ _video_src | basename }}"
+    _video_stem: "{{ _video_name | splitext | first }}"
+    _remote_video: "{{ remote_video_dir }}/{{ _video_name }}"
+    _remote_output: "{{ remote_results_dir }}/{{ _video_stem }}_results.csv"
+    _local_output:  "{{ local_results_dir }}/{{ inventory_hostname }}_{{ _video_stem }}_results.csv"
+
+  tasks:
+
+    # ── Prepare remote directories ─────────────────────────────────────────────
+
+    - name: Create remote directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ remote_video_dir }}"
+        - "{{ remote_results_dir }}"
+
+    # ── Sync code ──────────────────────────────────────────────────────────────
+
+    - name: Sync pipeline scripts to Jetson
+      synchronize:
+        src: "{{ item }}"
+        dest: "{{ project_dir }}/"
+        checksum: true
+      loop:
+        - "/home/cams/Desktop/Akshay/JetsonDistributedComp/jetson_pipeline.py"
+        - "/home/cams/Desktop/Akshay/JetsonDistributedComp/onnx_runner.py"
+
+    # ── Sync video ─────────────────────────────────────────────────────────────
+
+    - name: Check if video already on Jetson
+      stat:
+        path: "{{ _remote_video }}"
+      register: video_stat
+
+    - name: "Sync video {{ _video_name }} → {{ inventory_hostname }}"
+      synchronize:
+        src: "{{ _video_src }}"
+        dest: "{{ _remote_video }}"
+        checksum: true
+      when: not video_stat.stat.exists
+
+    - name: Show video status
+      debug:
+        msg: >
+          {{ inventory_hostname }}: {{ _video_name }}
+          ({{ 'already present' if video_stat.stat.exists else 'synced now' }})
+
+    # ── Run pipeline ───────────────────────────────────────────────────────────
+    # Output is tee'd to a .log file so you can monitor live progress via:
+    #   ssh nvidia@<jetson_ip> "tail -f ~/JetsonDistributedComp/results/<video_stem>.log"
+
+    - name: "Run jetson_pipeline.py on {{ inventory_hostname }}"
+      shell: >
+        python3 {{ project_dir }}/jetson_pipeline.py
+        --video {{ _remote_video }}
+        --rtdetr {{ rtdetr_model }}
+        --rtmpose {{ rtmpose_model }}
+        --id-model {{ id_model }}
+        --output {{ _remote_output }}
+        --conf {{ detection_conf }}
+        --skip-frames {{ skip_frames }}
+        --rtmpose-input-size {{ rtmpose_input_size }}
+        --monkey-names {{ monkey_names }}
+        2>&1 | tee {{ remote_results_dir }}/{{ _video_stem }}.log
+      async: 144000    # 4-hour timeout — increase for very long videos
+      poll: 30        # Ansible checks every 30 s; live output is in the .log file
+      register: pipeline_run
+
+    - name: Show pipeline tail (last 5 lines of log)
+      debug:
+        msg: "{{ pipeline_run.stdout_lines[-5:] | default([]) }}"
+
+    # ── Collect results ────────────────────────────────────────────────────────
+
+    - name: Create local results directory
+      delegate_to: localhost
+      file:
+        path: "{{ local_results_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "Fetch CSV results from {{ inventory_hostname }}"
+      fetch:
+        src: "{{ _remote_output }}"
+        dest: "{{ _local_output }}"
+        flat: true
+
+    - name: "Fetch summary from {{ inventory_hostname }}"
+      fetch:
+        src: "{{ remote_results_dir }}/{{ _video_stem }}_results.summary.txt"
+        dest: "{{ local_results_dir }}/{{ inventory_hostname }}_{{ _video_stem }}.summary.txt"
+        flat: true
+
+    - name: "Fetch log from {{ inventory_hostname }}"
+      fetch:
+        src: "{{ remote_results_dir }}/{{ _video_stem }}.log"
+        dest: "{{ local_results_dir }}/{{ inventory_hostname }}_{{ _video_stem }}.log"
+        flat: true
+
+    - name: Show summary for {{ inventory_hostname }}
+      command: "cat {{ local_results_dir }}/{{ inventory_hostname }}_{{ _video_stem }}.summary.txt"
+      delegate_to: localhost
+      changed_when: false
+      register: summary_cat
+
+    - name: Print summary
+      debug:
+        msg: "{{ summary_cat.stdout_lines }}"

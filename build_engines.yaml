@@ -1,0 +1,160 @@
+---
+# build_engines.yaml — Build TensorRT engines for all 3 models on all Jetsons.
+#
+# Models and approach:
+#   RT-DETR   — export via ultralytics on Jetson (torch 1.13 works; torch 2.x does not)
+#   RTMPose   — trtexec from .onnx (dynamic batch, 256×256 input)
+#   ID model  — trtexec from .onnx (fixed 640×640 input)
+#
+# Engines are device-specific — must be built on each Jetson, not the GPU PC.
+# All 4 Jetsons run in parallel (~10-20 min total).
+#
+# Run with:
+#   ansible-playbook -i inventory.yaml build_engines.yaml
+#   ansible-playbook -i inventory.yaml build_engines.yaml --limit j001
+
+- name: Build TensorRT engines on Jetsons
+  hosts: jetsons
+  gather_facts: false
+
+  vars:
+    local_models_dir:  "/home/cams/Desktop/Akshay/JetsonDistributedComp/converted_models"
+    remote_models_dir: "/home/nvidia/JetsonDistributedComp/converted_models"
+    trtexec: "/usr/src/tensorrt/bin/trtexec"
+
+    rtdetr_pt:     "RT-DETR_640.pt"
+    rtdetr_engine: "RT-DETR_640.engine"
+
+    rtmpose_onnx:       "rtmpose_homecage_best_size256.onnx"
+    rtmpose_engine:     "rtmpose_homecage_best_size256.engine"
+    rtmpose_input_name: "image"
+    rtmpose_min:        "1x3x256x256"
+    rtmpose_opt:        "4x3x256x256"
+    rtmpose_max:        "8x3x256x256"
+
+    id_onnx:       "ID_model_ElmJok_Apr2026.onnx"
+    id_engine:     "ID_model_ElmJok_Apr2026.engine"
+    id_input_name: "images"
+    id_shape:      "1x3x640x640"
+
+  tasks:
+
+    # ── Sync models ────────────────────────────────────────────────────────────
+
+    - name: Create remote models directory
+      file:
+        path: "{{ remote_models_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Sync converted_models/ from GPU PC to Jetson
+      synchronize:
+        src: "{{ local_models_dir }}/"
+        dest: "{{ remote_models_dir }}/"
+        recursive: true
+        checksum: true
+        delete: false
+
+    # ── RT-DETR engine (ultralytics native — handles output decoding correctly) ──
+
+    - name: Check if RT-DETR engine already exists
+      stat:
+        path: "{{ remote_models_dir }}/{{ rtdetr_engine }}"
+      register: rtdetr_engine_stat
+
+    - name: Check if RT-DETR ONNX exists (needed for trtexec)
+      stat:
+        path: "{{ remote_models_dir }}/RT-DETR_640.onnx"
+      register: rtdetr_onnx_stat
+
+    - name: Export RT-DETR to ONNX on Jetson (torch 1.13 works; torch 2.x does not)
+      # Only runs if ONNX doesn't exist yet. Takes ~4 min.
+      shell: |
+        cd {{ remote_models_dir }}
+        python3 -c "
+        from ultralytics import RTDETR
+        m = RTDETR('{{ rtdetr_pt }}')
+        m.export(format='onnx', imgsz=640, opset=16, simplify=True)
+        " 2>&1
+      when: not rtdetr_engine_stat.stat.exists and not rtdetr_onnx_stat.stat.exists
+      async: 600
+      poll: 15
+
+    - name: Build RT-DETR TRT engine via trtexec (fp16, fixed 640×640)
+      command: >
+        {{ trtexec }}
+        --onnx={{ remote_models_dir }}/RT-DETR_640.onnx
+        --saveEngine={{ remote_models_dir }}/RT-DETR_640.engine
+        --fp16
+        --minShapes=images:1x3x640x640
+        --optShapes=images:1x3x640x640
+        --maxShapes=images:1x3x640x640
+      when: not rtdetr_engine_stat.stat.exists
+      async: 1800
+      poll: 30
+      register: rtdetr_build
+
+    - name: Show RT-DETR build result
+      debug:
+        msg: "{{ rtdetr_build.stdout_lines[-5:] | default(['(skipped — engine already exists)']) }}"
+
+    # ── RTMPose engine ─────────────────────────────────────────────────────────
+
+    - name: Check if RTMPose engine already exists
+      stat:
+        path: "{{ remote_models_dir }}/{{ rtmpose_engine }}"
+      register: rtmpose_engine_stat
+
+    - name: Build RTMPose TRT engine (fp16, dynamic batch 1-8)
+      command: >
+        {{ trtexec }}
+        --onnx={{ remote_models_dir }}/{{ rtmpose_onnx }}
+        --saveEngine={{ remote_models_dir }}/{{ rtmpose_engine }}
+        --fp16
+        --minShapes={{ rtmpose_input_name }}:{{ rtmpose_min }}
+        --optShapes={{ rtmpose_input_name }}:{{ rtmpose_opt }}
+        --maxShapes={{ rtmpose_input_name }}:{{ rtmpose_max }}
+      when: not rtmpose_engine_stat.stat.exists
+      async: 900
+      poll: 10
+      register: rtmpose_build
+
+    - name: Show RTMPose build result
+      debug:
+        msg: "{{ rtmpose_build.stdout_lines[-5:] | default(['(skipped — engine already exists)']) }}"
+
+    # ── ID model engine ────────────────────────────────────────────────────────
+
+    - name: Check if ID model engine already exists
+      stat:
+        path: "{{ remote_models_dir }}/{{ id_engine }}"
+      register: id_engine_stat
+
+    - name: Build ID model TRT engine (fp16, fixed 640×640)
+      command: >
+        {{ trtexec }}
+        --onnx={{ remote_models_dir }}/{{ id_onnx }}
+        --saveEngine={{ remote_models_dir }}/{{ id_engine }}
+        --fp16
+        --minShapes={{ id_input_name }}:{{ id_shape }}
+        --optShapes={{ id_input_name }}:{{ id_shape }}
+        --maxShapes={{ id_input_name }}:{{ id_shape }}
+      when: not id_engine_stat.stat.exists
+      async: 1800
+      poll: 15
+      register: id_build
+
+    - name: Show ID model build result
+      debug:
+        msg: "{{ id_build.stdout_lines[-5:] | default(['(skipped — engine already exists)']) }}"
+
+    # ── Verify all engines ─────────────────────────────────────────────────────
+
+    - name: List engines on {{ inventory_hostname }}
+      shell: "ls -lh {{ remote_models_dir }}/*.engine"
+      changed_when: false
+      register: engine_ls
+
+    - name: Show engines
+      debug:
+        msg: "{{ engine_ls.stdout_lines }}"

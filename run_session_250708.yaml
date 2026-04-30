@@ -1,0 +1,192 @@
+---
+# run_session_250708.yaml — Run the 250708 4-video session on all Jetsons.
+#
+# This playbook maps the four videos in /home/cams/homecage_data/DATA/RAW/250708/
+# to j001-j004, runs the Jetson pipeline, and fetches the outputs back to the
+# head computer under /home/cams/homecage_data/DATA/POST/250708/jetson_run/.
+#
+# Run with:
+#   ansible-playbook -i inventory.yaml run_session_250708.yaml
+#   ansible-playbook -i inventory.yaml run_session_250708.yaml --limit j001
+
+- name: Run 250708 monkey detection + pose + ID pipeline on all Jetsons
+  hosts: jetsons
+  gather_facts: false
+
+  vars:
+    # ── Input videos for this session ───────────────────────────────────────
+    video_assignments:
+      j001: "/home/cams/homecage_data/DATA/RAW/250708/Elm_Jok_manual_1_117_20250708170005.mp4"
+      j002: "/home/cams/homecage_data/DATA/RAW/250708/Elm_Jok_manual_1_108_20250708170005.mp4"
+      j003: "/home/cams/homecage_data/DATA/RAW/250708/Elm_Jok_manual_1_102_20250708170005.mp4"
+      j004: "/home/cams/homecage_data/DATA/RAW/250708/Elm_Jok_manual_1_113_20250708170005.mp4"
+
+    # ── Paths on the Jetsons / head computer ────────────────────────────────
+    project_dir: "/home/nvidia/JetsonDistributedComp"
+    models_dir: "/home/nvidia/JetsonDistributedComp/converted_models"
+    remote_video_dir: "/home/nvidia/session_videos"
+    remote_results_dir: "/home/nvidia/JetsonDistributedComp/results"
+    local_results_dir: "/home/cams/homecage_data/DATA/POST/250708/jetson_run"
+
+    rtdetr_model: "{{ models_dir }}/RT-DETR_640.pt"
+    rtmpose_model: "{{ models_dir }}/rtmpose_homecage_best_size256.onnx"
+    id_model: "{{ models_dir }}/ID_model_ElmJok_Apr2026.onnx"
+
+    # Pipeline settings
+    detection_conf: "0.5"
+    skip_frames: "1"
+    rtmpose_input_size: "256,256"
+    monkey_names: "Elm,Jok"
+
+    # Derived per-host values
+    _video_src: "{{ video_assignments[inventory_hostname] }}"
+    _video_name: "{{ _video_src | basename }}"
+    _video_stem: "{{ _video_name | splitext | first }}"
+    _remote_video: "{{ remote_video_dir }}/{{ _video_name }}"
+    _remote_output: "{{ remote_results_dir }}/{{ _video_stem }}_results.csv"
+    _local_output: "{{ local_results_dir }}/{{ inventory_hostname }}_{{ _video_stem }}_results.csv"
+
+  tasks:
+    - name: Create remote directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ remote_video_dir }}"
+        - "{{ remote_results_dir }}"
+
+    - name: Sync pipeline scripts to Jetson
+      synchronize:
+        src: "{{ item }}"
+        dest: "{{ project_dir }}/"
+        checksum: true
+      loop:
+        - "/home/cams/Desktop/Akshay/JetsonDistributedComp/jetson_pipeline.py"
+        - "/home/cams/Desktop/Akshay/JetsonDistributedComp/onnx_runner.py"
+
+    - name: Check if video already on Jetson
+      stat:
+        path: "{{ _remote_video }}"
+      register: video_stat
+
+    - name: "Sync video {{ _video_name }} → {{ inventory_hostname }}"
+      synchronize:
+        src: "{{ _video_src }}"
+        dest: "{{ _remote_video }}"
+        checksum: true
+      when: not video_stat.stat.exists
+
+    - name: Show video status
+      debug:
+        msg: >
+          {{ inventory_hostname }}: {{ _video_name }}
+          ({{ 'already present' if video_stat.stat.exists else 'synced now' }})
+
+    - name: "Run jetson_pipeline.py on {{ inventory_hostname }}"
+      shell: >
+        python3 {{ project_dir }}/jetson_pipeline.py
+        --video {{ _remote_video }}
+        --rtdetr {{ rtdetr_model }}
+        --rtmpose {{ rtmpose_model }}
+        --id-model {{ id_model }}
+        --output {{ _remote_output }}
+        --conf {{ detection_conf }}
+        --skip-frames {{ skip_frames }}
+        --rtmpose-input-size {{ rtmpose_input_size }}
+        --monkey-names {{ monkey_names }}
+        2>&1 | tee {{ remote_results_dir }}/{{ _video_stem }}.log
+      async: 144000
+      poll: 30
+      register: pipeline_run
+
+    - name: Show pipeline tail (last 5 lines of log)
+      debug:
+        msg: "{{ pipeline_run.stdout_lines[-5:] | default([]) }}"
+
+    - name: Create local results directory
+      delegate_to: localhost
+      file:
+        path: "{{ local_results_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "Fetch CSV results from {{ inventory_hostname }}"
+      fetch:
+        src: "{{ _remote_output }}"
+        dest: "{{ _local_output }}"
+        flat: true
+
+    - name: "Fetch summary from {{ inventory_hostname }}"
+      fetch:
+        src: "{{ remote_results_dir }}/{{ _video_stem }}_results.summary.txt"
+        dest: "{{ local_results_dir }}/{{ inventory_hostname }}_{{ _video_stem }}.summary.txt"
+        flat: true
+
+    - name: "Fetch log from {{ inventory_hostname }}"
+      fetch:
+        src: "{{ remote_results_dir }}/{{ _video_stem }}.log"
+        dest: "{{ local_results_dir }}/{{ inventory_hostname }}_{{ _video_stem }}.log"
+        flat: true
+
+    - name: Build compute time summary on the head computer
+      delegate_to: localhost
+      run_once: true
+      shell: |
+        python3 - <<'PYEOF'
+        from pathlib import Path
+        import re
+
+        results_dir = Path("{{ local_results_dir }}")
+        summary_files = sorted(results_dir.glob("*.summary.txt"))
+        lines = []
+        total_elapsed = 0.0
+        total_frames = 0
+        total_detections = 0
+
+        def grab(pattern: str, text: str, default: str = "") -> str:
+            m = re.search(pattern, text, re.MULTILINE)
+            return m.group(1).strip() if m else default
+
+        for summary_file in summary_files:
+            text = summary_file.read_text()
+            video = grab(r"^video:\s+(.*)$", text)
+            frames_processed = int(grab(r"^frames_processed:\s+(\d+)$", text, "0"))
+            detections = int(grab(r"^total_detections:\s+(\d+)$", text, "0"))
+            total_time = grab(r"^total_time:\s+.*\(([-0-9.]+)s\)$", text, "0")
+            fps = grab(r"^processing_fps:\s+([-0-9.]+)$", text, "0")
+            det_ms = grab(r"^avg_det_ms:\s+([-0-9.]+)$", text, "0")
+            pose_ms = grab(r"^avg_pose_ms:\s+([-0-9.]+)$", text, "0")
+            id_ms = grab(r"^avg_id_ms:\s+([-0-9.]+)$", text, "0")
+            elapsed = float(total_time)
+            total_elapsed += elapsed
+            total_frames += frames_processed
+            total_detections += detections
+            lines.append(
+                f"{summary_file.name}: video={video} frames={frames_processed} dets={detections} "
+                f"time={elapsed:.2f}s fps={float(fps):.2f} det_ms={float(det_ms):.1f} "
+                f"pose_ms={float(pose_ms):.1f} id_ms={float(id_ms):.1f}"
+            )
+
+        lines.append("")
+        lines.append(f"session_total_frames: {total_frames}")
+        lines.append(f"session_total_detections: {total_detections}")
+        lines.append(f"session_total_elapsed_s: {total_elapsed:.2f}")
+        lines.append(f"session_mean_elapsed_s: {total_elapsed / len(summary_files):.2f}" if summary_files else "session_mean_elapsed_s: 0.00")
+        lines.append(f"session_mean_fps: {total_frames / total_elapsed:.2f}" if total_elapsed else "session_mean_fps: 0.00")
+
+        summary_path = results_dir / "compute_time_summary.txt"
+        summary_path.write_text("\n".join(lines) + "\n")
+        print(summary_path)
+        PYEOF
+      changed_when: true
+
+    - name: Show summary for {{ inventory_hostname }}
+      command: "cat {{ local_results_dir }}/{{ inventory_hostname }}_{{ _video_stem }}.summary.txt"
+      delegate_to: localhost
+      changed_when: false
+      register: summary_cat
+
+    - name: Print summary
+      debug:
+        msg: "{{ summary_cat.stdout_lines }}"

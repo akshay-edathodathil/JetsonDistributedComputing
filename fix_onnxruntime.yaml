@@ -1,0 +1,49 @@
+---
+# fix_onnxruntime.yaml — Restore clean onnxruntime on all Jetsons.
+#
+# The user-level install had both onnxruntime (CPU) and onnxruntime-gpu (GPU)
+# fighting over the same files. This playbook removes both and reinstalls the
+# CPU version cleanly. onnxruntime-gpu for aarch64 is not on PyPI; TRT engines
+# are the GPU path if needed later.
+#
+# Run with:
+#   ansible-playbook -i inventory.yaml fix_onnxruntime.yaml
+
+- name: Restore clean onnxruntime on Jetsons
+  hosts: jetsons
+  gather_facts: false
+
+  vars:
+    wheel_dir: "/home/nvidia/jetson_ray_install"
+    ort_wheel: "onnxruntime-1.15.1-cp38-cp38-manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
+    local_wheel_dir: "/home/cams/Desktop/Jetson_Ray_Install"
+
+  tasks:
+
+    - name: Sync wheel directory (includes new onnxruntime wheel)
+      synchronize:
+        src: "{{ local_wheel_dir }}/"
+        dest: "{{ wheel_dir }}/"
+        recursive: true
+        checksum: true
+        delete: false
+
+    - name: Remove conflicting onnxruntime installations
+      command: pip3 uninstall onnxruntime onnxruntime-gpu -y
+      failed_when: false
+
+    - name: Install clean onnxruntime from local wheel
+      command: >
+        pip3 install
+        --no-index
+        --find-links={{ wheel_dir }}
+        onnxruntime==1.15.1
+
+    - name: Verify onnxruntime and available providers
+      command: python3 -c "import onnxruntime as ort; print('version:', ort.__version__); print('providers:', ort.get_available_providers())"
+      changed_when: false
+      register: ort_check
+
+    - name: Show onnxruntime status on {{ inventory_hostname }}
+      debug:
+        msg: "{{ ort_check.stdout_lines }}"

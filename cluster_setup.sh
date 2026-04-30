@@ -223,32 +223,68 @@ cmd_restart() {
     cmd_start "$num_workers"
 }
 
+# ── sync-models: push converted_models/ to all Jetsons ───────────────────────
+cmd_sync_models() {
+    log "Syncing converted_models/ to ${#JETSON_IPS[@]} Jetsons..."
+    local failed=0
+    for ip in "${JETSON_IPS[@]}"; do
+        log "  → $ip"
+        if rsync -avz --progress --checksum \
+            --exclude '*.engine' \
+            "${SCRIPT_DIR}/converted_models/" \
+            "${WORKER_USER}@${ip}:${WORKER_PROJECT_DIR}/converted_models/"; then
+            log "  ✓ $ip models synced"
+        else
+            err "  ✗ $ip model sync failed"
+            (( failed++ )) || true
+        fi
+    done
+    [[ $failed -eq 0 ]] && log "Models sync complete." || err "$failed Jetson(s) failed."
+    return $failed
+}
+
+# ── run-session: run the inference pipeline on all Jetsons ───────────────────
+cmd_run_session() {
+    log "Running session pipeline via Ansible..."
+    if ! command -v ansible-playbook &>/dev/null; then
+        err "ansible-playbook not found."
+        exit 1
+    fi
+    ansible-playbook -i "${SCRIPT_DIR}/inventory.yaml" "${SCRIPT_DIR}/run_session.yaml" "$@"
+}
+
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 usage() {
     cat <<EOF
 Usage: $0 <command> [options]
 
-Commands:
+Cluster commands:
   ssh-keys          One-time: deploy SSH key to all Jetsons (needs password once)
   sync              Rsync project code to all Jetsons
-  setup             Sync code + create venv on each Jetson
-  start [N]         Start head + N workers (default: all 4)
+  start [N]         Start Ray head + N workers (default: all 4)
   start-head        Start Ray head node only
-  start-workers [N] Start N worker nodes only
+  start-workers [N] Start N Ray worker nodes only
   stop              Stop Ray on all nodes
   restart [N]       Stop then start with N workers
   status            Show cluster status
 
+Session / inference commands:
+  sync-models       Rsync converted_models/ to all Jetsons (skips .engine files)
+  run-session       Run per-video inference pipeline on all Jetsons via Ansible
+                    (edit video_assignments in run_session.yaml first)
+
 First-time setup order:
   $0 ssh-keys       # Deploy SSH keys (once only)
-  $0 setup          # Sync code + create Jetson venvs
-  $0 start          # Launch Ray cluster
+  $0 sync           # Sync code to Jetsons
+  $0 sync-models    # Sync model files to Jetsons
+
+Per-session inference:
+  $0 run-session    # Distribute videos, run pipeline, collect CSVs
 
 Examples:
-  $0 start          # Start full 4-Jetson cluster
-  $0 start 1        # Start with 1 Jetson only (for testing)
-  $0 stop
-  $0 status
+  $0 sync-models
+  $0 run-session
+  $0 run-session --limit j001   # Test on one Jetson only
 EOF
 }
 
@@ -262,5 +298,7 @@ case "${1:-}" in
     stop)           cmd_stop ;;
     restart)        cmd_restart "${2:-}" ;;
     status)         cmd_status ;;
+    sync-models)    cmd_sync_models ;;
+    run-session)    shift; cmd_run_session "$@" ;;
     *)              usage; exit 1 ;;
 esac

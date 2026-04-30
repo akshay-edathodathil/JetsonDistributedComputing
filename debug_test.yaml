@@ -1,0 +1,57 @@
+---
+- name: Debug test — check ID model backend
+  hosts: j001
+  gather_facts: false
+  vars:
+    project_dir: "/home/nvidia/JetsonDistributedComp"
+    models_dir:  "/home/nvidia/JetsonDistributedComp/converted_models"
+    remote_video_dir: "/home/nvidia/session_videos"
+    remote_results_dir: "/home/nvidia/JetsonDistributedComp/results"
+    video_src: "/home/cams/Desktop/Akshay/multi_camera_test_videos/Elm_Jok_manual_1_117_20250708170005_1min.mp4"
+    video_name: "test_debug_1min.mp4"
+    output_csv: "test_debug_results.csv"
+
+  tasks:
+    - name: Create directories
+      file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ remote_video_dir }}"
+        - "{{ remote_results_dir }}"
+
+    - name: Sync test video
+      synchronize:
+        src: "{{ video_src }}"
+        dest: "{{ remote_video_dir }}/{{ video_name }}"
+        checksum: true
+
+    - name: Run pipeline with DEBUG logging (first 10 frames only)
+      shell: |
+        cd {{ project_dir }}
+        export PYTHONUNBUFFERED=1
+        python3 -u jetson_pipeline.py \
+          --video {{ remote_video_dir }}/{{ video_name }} \
+          --rtdetr {{ models_dir }}/RT-DETR_640.pt \
+          --rtmpose {{ models_dir }}/rtmpose_homecage_best_size256.onnx \
+          --id-model {{ models_dir }}/ID_model_ElmJok_Apr2026.onnx \
+          --output {{ remote_results_dir }}/{{ output_csv }} \
+          --conf 0.5 \
+          --skip-frames 30 \
+          --rtmpose-input-size 256,256 \
+          --monkey-names Elm,Jok \
+          2>&1 | head -100
+      register: debug_output
+
+    - name: Show DEBUG output
+      debug:
+        msg: "{{ debug_output.stdout_lines }}"
+
+    - name: List ID engine to confirm file exists
+      shell: "ls -lh {{ models_dir }}/ID_model_ElmJok_Apr2026.* | grep -E '(onnx|engine)'"
+      register: id_files
+      changed_when: false
+
+    - name: Show ID model files
+      debug:
+        msg: "{{ id_files.stdout_lines }}"

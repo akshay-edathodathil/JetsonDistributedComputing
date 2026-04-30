@@ -1,0 +1,52 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local env files
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Jupyter and editor/system noise
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+# Logs and runtime outputs
+*.log
+logs/
+*.out
+*.tmp
+
+# ML model artifacts (do not upload)
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+*.ts
+*.ckpt
+*.weights
+*.safetensors
+
+# Model folders and conversion outputs
+converted_models/
+models/
+checkpoints/
+weights/
+runs/
+artifacts/
+
+# Local deployment bundles
+ray_jetson_image.tar
+*.tar
+*.tar.gz
+
+# Optional: keep docs and source code tracked
+# (No excludes for *.md, *.py, *.yaml, *.sh by design)

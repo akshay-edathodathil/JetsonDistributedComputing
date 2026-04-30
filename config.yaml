@@ -62,3 +62,24 @@ benchmark:
   # Frame index at which to kill worker 0 during fault injection test
   fault_inject_at_frame: 100
   results_dir: "results"
+
+session:
+  # Models used by jetson_pipeline.py
+  rtdetr_model: "converted_models/RT-DETR_640.pt"
+  rtmpose_model: "converted_models/rtmpose_homecage_best_size256.onnx"
+  id_model: "converted_models/ID_model_ElmJok_Apr2026.onnx"
+  # Monkey class names ordered by class ID (0=Elm, 1=Jok)
+  monkey_names: ["Elm", "Jok"]
+  # RTMPose model input size: width, height (size256 model requires square 256x256)
+  rtmpose_input_size: [256, 256]
+  # Detection confidence threshold
+  detection_conf: 0.5
+  # Process every Nth frame (1=all frames, 2=every other, etc.)
+  skip_frames: 1
+  results_dir: "results"
+  # Video-to-Jetson assignments for run_session.yaml
+  video_assignments:
+    j001: "multi_camera_test_videos/Elm_Jok_manual_1_117_20250708170005_1min.mp4"
+    j002: "multi_camera_test_videos/Elm_Jok_manual_1_108_20250708170005_1min.mp4"
+    j003: "multi_camera_test_videos/Elm_Jok_manual_1_102_20250708170005_1min.mp4"
+    j004: "multi_camera_test_videos/Elm_Jok_manual_1_113_20250708170005_1min.mp4"

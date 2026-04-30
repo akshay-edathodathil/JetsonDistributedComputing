@@ -1,0 +1,26 @@
+---
+- name: Test ID model timing breakdown
+  hosts: j001
+  gather_facts: false
+  tasks:
+    - name: Run pipeline with detailed timing
+      shell: |
+        cd /home/nvidia/JetsonDistributedComp
+        timeout 120 python3 jetson_pipeline.py \
+          --video /home/nvidia/session_videos/test_debug_1min.mp4 \
+          --rtdetr /home/nvidia/JetsonDistributedComp/converted_models/RT-DETR_640.pt \
+          --rtmpose /home/nvidia/JetsonDistributedComp/converted_models/rtmpose_homecage_best_size256.onnx \
+          --id-model /home/nvidia/JetsonDistributedComp/converted_models/ID_model_ElmJok_Apr2026.onnx \
+          --output /home/nvidia/JetsonDistributedComp/results/debug_results.csv \
+          --conf 0.5 \
+          --skip-frames 6 \
+          --rtmpose-input-size 256,256 \
+          --monkey-names Elm,Jok \
+          2>&1
+      register: pipeline_output
+      async: 180
+      poll: 15
+      
+    - name: Show timing logs
+      debug:
+        msg: "{{ pipeline_output.stdout_lines[-30:] }}"
