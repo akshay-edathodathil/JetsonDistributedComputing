@@ -1,0 +1,109 @@
+---
+# deploy_ray.yaml — Offline Ray 2.4.0 installation on air-gapped Jetsons.
+#
+# Wheels are pre-downloaded (33 files) at ~/Desktop/Jetson_Ray_Install/.
+# To refresh them on the GPU PC (has internet), run:
+#   python3.8 -m pip download ray==2.4.0 \
+#     --platform manylinux2014_aarch64 \
+#     --python-version 38 \
+#     --only-binary=:all: \
+#     -d ~/Desktop/Jetson_Ray_Install/
+#
+# Run with:
+#   ansible-playbook -i inventory.yaml deploy_ray.yaml
+#   ansible-playbook -i inventory.yaml deploy_ray.yaml --limit j001   # single Jetson
+
+- name: Offline Ray 2.4.0 installation on Jetsons
+  hosts: jetsons
+  gather_facts: false
+
+  vars:
+    local_wheel_dir: "/home/cams/Desktop/Jetson_Ray_Install"
+    remote_wheel_dir: "/home/nvidia/jetson_ray_install"
+    ray_version: "2.4.0"
+
+  tasks:
+
+    # ── Pre-flight checks ──────────────────────────────────────────────────────
+
+    - name: Verify pip3 is present
+      command: pip3 --version
+      changed_when: false
+      register: pip3_check
+      failed_when: pip3_check.rc != 0
+
+    - name: Show pip3 version
+      debug:
+        msg: "{{ inventory_hostname }}: {{ pip3_check.stdout }}"
+
+    - name: Verify python3-setuptools is present
+      command: python3 -c "import setuptools; print(setuptools.__version__)"
+      changed_when: false
+      register: setuptools_check
+      failed_when: setuptools_check.rc != 0
+
+    - name: Show setuptools version
+      debug:
+        msg: "{{ inventory_hostname }}: setuptools {{ setuptools_check.stdout }}"
+
+    # ── Sync wheel folder ──────────────────────────────────────────────────────
+
+    - name: Create remote wheel directory
+      file:
+        path: "{{ remote_wheel_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Sync wheel folder from GPU PC to Jetson (rsync)
+      synchronize:
+        src: "{{ local_wheel_dir }}/"
+        dest: "{{ remote_wheel_dir }}/"
+        recursive: true
+        delete: false
+        checksum: true
+      register: sync_result
+
+    - name: List synced wheels
+      command: "ls -1 {{ remote_wheel_dir }}"
+      changed_when: false
+      register: wheel_listing
+
+    - name: Show wheel listing
+      debug:
+        msg: "{{ wheel_listing.stdout_lines }}"
+
+    # ── Install Ray ────────────────────────────────────────────────────────────
+
+    - name: Check if Ray {{ ray_version }} is already installed
+      command: python3 -c "import ray; print(ray.__version__)"
+      changed_when: false
+      failed_when: false
+      register: ray_check
+
+    - name: Install Ray {{ ray_version }} from local wheels (no internet)
+      command: >
+        pip3 install
+        --no-index
+        --find-links={{ remote_wheel_dir }}
+        ray=={{ ray_version }}
+      when: ray_check.rc != 0 or ray_version not in ray_check.stdout
+      register: pip_install
+      # Install as the nvidia user (no sudo needed for --user site-packages).
+      # If you need system-wide install, set become: true here and ensure
+      # ansible_become_password is set in inventory.yaml.
+
+    - name: Show pip install output
+      debug:
+        msg: "{{ pip_install.stdout_lines | default(['(already installed, skipped)']) }}"
+
+    # ── Verify ────────────────────────────────────────────────────────────────
+
+    - name: Verify Ray installation
+      command: python3 -c "import ray; print(ray.__version__)"
+      changed_when: false
+      register: ray_verify
+      failed_when: ray_verify.rc != 0
+
+    - name: Confirm Ray version
+      debug:
+        msg: "✓ {{ inventory_hostname }} ({{ ansible_host }}) — Ray {{ ray_verify.stdout }}"

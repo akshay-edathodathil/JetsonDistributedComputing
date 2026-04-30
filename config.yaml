@@ -11,7 +11,8 @@ cluster:
     - "192.168.1.5"   # j004
   username: "nvidia"
   project_dir: "~/JetsonDistributedComp"
-  venv_activate: "~/JetsonDistributedComp/venv/bin/activate"
+  # TCP port each Jetson inference_server.py listens on
+  inference_port: 9100
   # Path to venv on the GPU PC head node
   head_venv_activate: "/home/cams/Desktop/Akshay/.venv_mmpose/bin/activate"
 
