@@ -1,0 +1,155 @@
+---
+# run_synthetic_benchmark_3jetsons.yaml
+#
+# Benchmarks synthetic videos on j002/j003/j004 (j001 excluded), measures
+# per-video copy time and pipeline time, fetches outputs, and writes aggregated
+# benchmark reports on the head machine.
+
+- name: Run synthetic benchmark videos on 3 Jetsons
+  hosts: jetsons:!j001
+  gather_facts: false
+
+  vars:
+    manifest_path: "/home/cams/homecage_data/DATA/POST/LongVideosForTest/synthetic_benchmark_manifest.json"
+
+    project_dir: "/home/nvidia/JetsonDistributedComp"
+    models_dir: "/home/nvidia/JetsonDistributedComp/converted_models"
+    remote_video_dir: "/home/nvidia/session_videos_synth"
+    remote_results_dir: "/home/nvidia/JetsonDistributedComp/results_synth"
+
+    local_results_dir: "/home/cams/homecage_data/DATA/POST/LongVideosForTest/results"
+
+    rtdetr_model: "{{ models_dir }}/RT-DETR_640.pt"
+    rtmpose_model: "{{ models_dir }}/rtmpose_homecage_best_size256.onnx"
+    id_model: "{{ models_dir }}/ID_model_ElmJok_Apr2026.onnx"
+
+    detection_conf: "0.5"
+    skip_frames: "1"
+    rtmpose_input_size: "256,256"
+    monkey_names: "Elm,Jok"
+
+  tasks:
+    - name: Ensure local results directory exists
+      delegate_to: localhost
+      file:
+        path: "{{ local_results_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Load benchmark manifest
+      set_fact:
+        _manifest: "{{ lookup('file', manifest_path) | from_json }}"
+
+    - name: Build host video list from manifest
+      set_fact:
+        host_videos: "{{ _manifest.host_video_map[inventory_hostname] | default([]) }}"
+
+    - name: Show host assignment count
+      debug:
+        msg: "{{ inventory_hostname }} assigned {{ host_videos | length }} synthetic videos"
+
+    - name: Create remote directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ remote_video_dir }}"
+        - "{{ remote_results_dir }}"
+
+    - name: Sync pipeline scripts to Jetson
+      synchronize:
+        src: "{{ item }}"
+        dest: "{{ project_dir }}/"
+        checksum: true
+      loop:
+        - "/home/cams/Desktop/Akshay/JetsonDistributedComp/jetson_pipeline.py"
+        - "/home/cams/Desktop/Akshay/JetsonDistributedComp/onnx_runner.py"
+
+    - name: Run per-video synthetic benchmark workflow
+      include_tasks: "tasks/run_single_synth_video.yaml"
+      loop: "{{ host_videos }}"
+      loop_control:
+        loop_var: synth_item
+
+- name: Build aggregate benchmark reports on head machine
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    local_results_dir: "/home/cams/homecage_data/DATA/POST/LongVideosForTest/results"
+
+  tasks:
+    - name: Build aggregate benchmark CSV + text summary
+      shell: |
+        python3 - <<'PYEOF'
+        import json
+        from pathlib import Path
+
+        results_dir = Path("{{ local_results_dir }}")
+        timing_files = sorted(results_dir.glob("*.timing.json"))
+
+        csv_path = results_dir / "benchmark_timings.csv"
+        txt_path = results_dir / "benchmark_summary.txt"
+
+        rows = []
+        for p in timing_files:
+            try:
+                rows.append(json.loads(p.read_text()))
+            except Exception:
+                pass
+
+        header = [
+            "host", "video_name", "view", "monkey_count", "duration_h",
+            "copy_seconds", "pipeline_wall_seconds", "summary_total_seconds",
+            "processing_fps", "avg_det_ms", "avg_pose_ms", "avg_id_ms",
+            "total_detections", "frames_processed", "status"
+        ]
+
+        with csv_path.open("w", encoding="utf-8") as f:
+            f.write(",".join(header) + "\n")
+            for r in rows:
+                values = [
+                    str(r.get("host", "")),
+                    str(r.get("video_name", "")),
+                    str(r.get("view", "")),
+                    str(r.get("monkey_count", "")),
+                    str(r.get("duration_h", "")),
+                    str(r.get("copy_seconds", 0.0)),
+                    str(r.get("pipeline_wall_seconds", 0.0)),
+                    str(r.get("summary_total_seconds", 0.0)),
+                    str(r.get("processing_fps", 0.0)),
+                    str(r.get("avg_det_ms", 0.0)),
+                    str(r.get("avg_pose_ms", 0.0)),
+                    str(r.get("avg_id_ms", 0.0)),
+                    str(r.get("total_detections", 0)),
+                    str(r.get("frames_processed", 0)),
+                    str(r.get("status", "")),
+                ]
+                f.write(",".join(values) + "\n")
+
+        ok_rows = [r for r in rows if r.get("status") == "ok"]
+        copy_sum = sum(float(r.get("copy_seconds", 0.0)) for r in rows)
+        pipe_sum = sum(float(r.get("pipeline_wall_seconds", 0.0)) for r in rows)
+
+        lines = [
+            f"timing_files: {len(timing_files)}",
+            f"successful_runs: {len(ok_rows)}",
+            f"failed_runs: {len(rows) - len(ok_rows)}",
+            f"copy_seconds_sum: {copy_sum:.2f}",
+            f"pipeline_wall_seconds_sum: {pipe_sum:.2f}",
+        ]
+
+        if ok_rows:
+            lines.append(f"copy_seconds_mean: {copy_sum / len(rows):.2f}")
+            lines.append(f"pipeline_wall_seconds_mean: {pipe_sum / len(rows):.2f}")
+            lines.append(
+                "processing_fps_mean: "
+                + f"{sum(float(r.get('processing_fps', 0.0)) for r in ok_rows) / len(ok_rows):.2f}"
+            )
+
+        txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(csv_path)
+        print(txt_path)
+        PYEOF
+      changed_when: true

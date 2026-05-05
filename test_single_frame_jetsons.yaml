@@ -1,0 +1,207 @@
+---
+# test_single_frame_jetsons.yaml
+#
+# Tests one synthetic frame on each Jetson to validate:
+# - RT-DETR detection
+# - RTMPose inference
+# - ID model classification
+#
+# Run with:
+#   ansible-playbook -i inventory.yaml test_single_frame_jetsons.yaml
+#
+
+- name: Test single frame on Jetsons
+  hosts: jetsons:!j001
+  gather_facts: false
+
+  vars:
+    project_dir: "/home/nvidia/JetsonDistributedComp"
+    models_dir: "/home/nvidia/JetsonDistributedComp/converted_models"
+    remote_test_dir: "/home/nvidia/test_frame"
+    
+    rtdetr_model: "{{ models_dir }}/RT-DETR_640.pt"
+    rtmpose_model: "{{ models_dir }}/rtmpose_homecage_best_size256.onnx"
+    id_model: "{{ models_dir }}/ID_model_ElmJok_Apr2026.onnx"
+
+    detection_conf: "0.5"
+    rtmpose_input_size: "256,256"
+    monkey_names: "Elm,Jok"
+
+  tasks:
+    - name: Create remote test directory
+      file:
+        path: "{{ remote_test_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Sync pipeline scripts to Jetson
+      synchronize:
+        src: "{{ item }}"
+        dest: "{{ project_dir }}/"
+        checksum: true
+      loop:
+        - "/home/cams/Desktop/Akshay/JetsonDistributedComp/jetson_pipeline.py"
+        - "/home/cams/Desktop/Akshay/JetsonDistributedComp/onnx_runner.py"
+
+    - name: Copy test frame (10-monkey count) to Jetson
+      copy:
+        src: "/home/cams/homecage_data/DATA/POST/LongVideosForTest/8h/preview_view102_m10.png"
+        dest: "{{ remote_test_dir }}/test_frame_m10.png"
+      register: frame_copy_result
+
+    - name: Show frame copy result
+      debug:
+        msg: "Frame copied to {{ inventory_hostname }}: {{ frame_copy_result }}"
+
+    - name: Create test inference script on Jetson
+      copy:
+        dest: "{{ remote_test_dir }}/test_frame_inference.py"
+        mode: "0755"
+        content: |
+          #!/usr/bin/env python3
+          """Test single frame detection on Jetson."""
+          import sys
+          import cv2
+          import numpy as np
+          import time
+          from pathlib import Path
+
+          # Import pipeline components
+          sys.path.insert(0, "/home/nvidia/JetsonDistributedComp")
+          from onnx_runner import RTDETROnnx, RTMPoseOnnx, IDModelOnnx
+
+          frame_path = "/home/nvidia/test_frame/test_frame_m10.png"
+          rtdetr_model = "/home/nvidia/JetsonDistributedComp/converted_models/RT-DETR_640.pt"
+          rtmpose_model = "/home/nvidia/JetsonDistributedComp/converted_models/rtmpose_homecage_best_size256.onnx"
+          id_model = "/home/nvidia/JetsonDistributedComp/converted_models/ID_model_ElmJok_Apr2026.onnx"
+          rtdetr_model = "/home/nvidia/JetsonDistributedComp/converted_models/RT-DETR_640.pt"
+          rtmpose_model = "/home/nvidia/JetsonDistributedComp/converted_models/rtmpose_homecage_best_size256.onnx"
+          id_model = "/home/nvidia/JetsonDistributedComp/converted_models/ID_model_ElmJok_Apr2026.onnx"
+
+          print(f"Loading frame: {frame_path}")
+          frame = cv2.imread(frame_path)
+          if frame is None:
+              print(f"ERROR: Failed to load frame")
+              exit(1)
+
+          h, w = frame.shape[:2]
+          print(f"Frame size: {w}×{h}")
+          print()
+
+          # Load models
+          print("Loading models...")
+          
+          # RT-DETR: Try TRT engine first, fall back to ultralytics .pt
+          from pathlib import Path
+          engine_path = Path(rtdetr_model).with_suffix(".engine")
+          if engine_path.exists():
+              rtdetr = RTDETROnnx(str(engine_path))
+              print(f"✓ RT-DETR TRT loaded: {engine_path}")
+          else:
+              from ultralytics import RTDETR
+              rtdetr = RTDETR(rtdetr_model)
+              print(f"✓ RT-DETR PyTorch loaded: {rtdetr_model}")
+          
+          rtmpose = RTMPoseOnnx(rtmpose_model, input_size=(256, 256))
+          id_clf = IDModelOnnx(id_model)
+          print("✓ RTMPose and ID models loaded")
+          print()
+
+          # Run detection
+          print("=" * 60)
+          print("DETECTION TEST")
+          print("=" * 60)
+          t0 = time.perf_counter()
+          
+          # Handle both RTDETROnnx and ultralytics RTDETR
+          if hasattr(rtdetr, 'infer'):
+              # RTDETROnnx API: returns list of (bbox, conf)
+              detections = rtdetr.infer(frame, conf=0.5)
+          else:
+              # Ultralytics API: returns results with boxes
+              results = rtdetr(frame, conf=0.5, verbose=False)
+              detections = []
+              if results and results[0].boxes is not None:
+                  for box, conf in zip(results[0].boxes.xyxy.cpu().numpy(), results[0].boxes.conf.cpu().numpy()):
+                      detections.append((tuple(float(v) for v in box), float(conf)))
+          
+          t_det = time.perf_counter() - t0
+          print(f"Detections: {len(detections)}")
+          print(f"Detection time: {t_det*1000:.1f} ms")
+          
+          # If TRT returned 0 detections, try PyTorch fallback
+          if len(detections) == 0 and hasattr(rtdetr, 'infer'):
+              print("\n⚠ TRT engine returned 0 detections - trying PyTorch fallback...")
+              from ultralytics import RTDETR
+              rtdetr_pt = RTDETR(rtdetr_model.replace('.engine', '.pt'))
+              t0 = time.perf_counter()
+              results = rtdetr_pt(frame, conf=0.5, verbose=False)
+              detections = []
+              if results and results[0].boxes is not None:
+                  for box, conf in zip(results[0].boxes.xyxy.cpu().numpy(), results[0].boxes.conf.cpu().numpy()):
+                      detections.append((tuple(float(v) for v in box), float(conf)))
+              t_det_pt = time.perf_counter() - t0
+              print(f"PyTorch detections: {len(detections)}")
+              print(f"PyTorch detection time: {t_det_pt*1000:.1f} ms")
+          
+          print()
+
+          # Run pose + ID for first 3 detections
+          print("=" * 60)
+          print("POSE + ID TEST (first 3 detections)")
+          print("=" * 60)
+          for i, (bbox, conf) in enumerate(detections[:3]):
+              x1, y1, x2, y2 = bbox
+              print(f"\nDetection {i+1}: bbox=({int(x1)},{int(y1)},{int(x2)},{int(y2)}) conf={conf:.3f}")
+              
+              # RTMPose
+              t_pose = time.perf_counter()
+              keypoints = rtmpose.infer(frame, (x1, y1, x2, y2))
+              t_pose = time.perf_counter() - t_pose
+              valid_kps = sum(1 for kx, ky, ks in keypoints if ks > 0)
+              print(f"  RTMPose: {valid_kps}/17 valid keypoints, {t_pose*1000:.1f} ms")
+              
+              # ID
+              t_id = time.perf_counter()
+              monkey_id, id_conf = id_clf.infer(frame, (x1, y1, x2, y2))
+              t_id = time.perf_counter() - t_id
+              id_name = ["Elm", "Jok"][monkey_id] if monkey_id < 2 else f"ID{monkey_id}"
+              print(f"  ID Model: {id_name} (conf={id_conf:.3f}), {t_id*1000:.1f} ms")
+
+          print()
+          print("=" * 60)
+          print("✓ Test complete - models working!")
+          print("=" * 60)
+
+    - name: Run test frame inference on Jetson
+      shell: |
+        cd /home/nvidia/test_frame && python3 test_frame_inference.py
+      register: test_result
+
+    - name: Show inference results
+      debug:
+        msg: "{{ test_result.stdout_lines }}"
+
+    - name: Write test results to local file
+      delegate_to: localhost
+      copy:
+        content: "{{ inventory_hostname }}\n{{ '=' * 60 }}\n{{ test_result.stdout }}"
+        dest: "/home/cams/Desktop/Akshay/JetsonDistributedComp/test_results_{{ inventory_hostname }}.txt"
+
+- name: Show test results summary
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Display all results
+      shell: |
+        echo "=== TEST RESULTS ==="
+        for f in /home/cams/Desktop/Akshay/JetsonDistributedComp/test_results_j*.txt; do
+          echo ""
+          cat "$f"
+        done
+      register: summary
+      changed_when: false
+
+    - name: Print summary
+      debug:
+        msg: "{{ summary.stdout_lines }}"

@@ -1,0 +1,53 @@
+- name: Run RT-DETR microbenchmark on Jetsons
+  hosts: jetsons:!j001
+  gather_facts: false
+
+  vars:
+    project_dir: "/home/nvidia/JetsonDistributedComp"
+    remote_test_dir: "/home/nvidia/test_frame"
+    rtdetr_model: "{{ project_dir }}/converted_models/RT-DETR_640.pt"
+    test_image: "{{ remote_test_dir }}/test_frame_m10.png"
+
+  tasks:
+    - name: Ensure remote test dir
+      file:
+        path: "{{ remote_test_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Copy microbench script to Jetson
+      copy:
+        src: microbench_remote.py
+        dest: "{{ remote_test_dir }}/microbench_remote.py"
+        mode: '0755'
+
+    - name: Ensure test image exists on Jetson
+      stat:
+        path: "{{ test_image }}"
+      register: imgstat
+
+    - name: Fail if test image missing
+      fail:
+        msg: "Test image not found on {{ inventory_hostname }} at {{ test_image }}"
+      when: not imgstat.stat.exists
+
+    - name: Run microbenchmark
+      shell: |
+        cd {{ remote_test_dir }} && python3 microbench_remote.py --model {{ rtdetr_model }} --image {{ test_image }} --iters 30 --warmup 5
+      register: bench
+      async: 600
+      poll: 0
+
+    - name: Wait for benchmark to finish and collect result file
+      async_status:
+        jid: "{{ bench.ansible_job_id }}"
+      register: bench_status
+      until: bench_status.finished
+      retries: 120
+      delay: 5
+
+    - name: Fetch microbench results
+      fetch:
+        src: "{{ remote_test_dir }}/microbench_results.json"
+        dest: "/home/cams/Desktop/Akshay/JetsonDistributedComp/results/microbench_{{ inventory_hostname }}.json"
+        flat: true

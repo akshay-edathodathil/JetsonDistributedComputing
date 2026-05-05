@@ -1,0 +1,185 @@
+---
+- name: Derive per-video paths
+  set_fact:
+    _video_src: "{{ synth_item.video_path }}"
+    _video_name: "{{ synth_item.video_name }}"
+    _video_stem: "{{ synth_item.video_name | splitext | first }}"
+    _remote_video: "{{ remote_video_dir }}/{{ synth_item.video_name }}"
+    _remote_output: "{{ remote_results_dir }}/{{ _video_stem }}_results.csv"
+    _remote_log: "{{ remote_results_dir }}/{{ _video_stem }}.log"
+    _remote_summary: "{{ remote_results_dir }}/{{ _video_stem }}_results.summary.txt"
+
+    _local_csv: "{{ local_results_dir }}/{{ inventory_hostname }}_{{ _video_stem }}_results.csv"
+    _local_log: "{{ local_results_dir }}/{{ inventory_hostname }}_{{ _video_stem }}.log"
+    _local_summary: "{{ local_results_dir }}/{{ inventory_hostname }}_{{ _video_stem }}.summary.txt"
+    _local_timing_txt: "{{ local_results_dir }}/{{ inventory_hostname }}_{{ _video_stem }}.timing.txt"
+    _local_timing_json: "{{ local_results_dir }}/{{ inventory_hostname }}_{{ _video_stem }}.timing.json"
+
+- name: Time rsync copy from head to Jetson
+  delegate_to: localhost
+  shell: |
+    set -e
+    start=$(python3 - <<'PY'
+    import time
+    print(time.time())
+    PY
+    )
+
+    rsync -a --checksum \
+      -e "ssh -i {{ ansible_ssh_private_key_file }} -o StrictHostKeyChecking=no" \
+      "{{ _video_src }}" "{{ ansible_user }}@{{ ansible_host }}:{{ _remote_video }}"
+
+    end=$(python3 - <<'PY'
+    import time
+    print(time.time())
+    PY
+    )
+
+    python3 - <<'PY' "$start" "$end"
+    import sys
+    print(f"{float(sys.argv[2]) - float(sys.argv[1]):.3f}")
+    PY
+  register: copy_timing
+  changed_when: true
+
+- name: Run pipeline and measure wall time on Jetson
+  shell: |
+    set -o pipefail
+
+    start=$(python3 - <<'PY'
+    import time
+    print(time.time())
+    PY
+    )
+
+    python3 {{ project_dir }}/jetson_pipeline.py \
+      --video {{ _remote_video }} \
+      --rtdetr {{ rtdetr_model }} \
+      --rtmpose {{ rtmpose_model }} \
+      --id-model {{ id_model }} \
+      --output {{ _remote_output }} \
+      --conf {{ detection_conf }} \
+      --skip-frames {{ skip_frames }} \
+      --rtmpose-input-size {{ rtmpose_input_size }} \
+      --monkey-names {{ monkey_names }} \
+      2>&1 | tee {{ _remote_log }}
+
+    end=$(python3 - <<'PY'
+    import time
+    print(time.time())
+    PY
+    )
+
+    python3 - <<'PY' "$start" "$end"
+    import sys
+    print(f"{float(sys.argv[2]) - float(sys.argv[1]):.3f}")
+    PY
+  args:
+    executable: /bin/bash
+  register: pipeline_timing
+  changed_when: true
+  ignore_errors: true
+
+- name: Fetch CSV/log/summary outputs
+  fetch:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    flat: true
+  loop:
+    - { src: "{{ _remote_output }}", dest: "{{ _local_csv }}" }
+    - { src: "{{ _remote_log }}", dest: "{{ _local_log }}" }
+    - { src: "{{ _remote_summary }}", dest: "{{ _local_summary }}" }
+  ignore_errors: true
+
+- name: Parse fetched summary metrics
+  delegate_to: localhost
+  shell: |
+    python3 - <<'PY' "{{ _local_summary }}"
+    import re
+    import sys
+    from pathlib import Path
+
+    p = Path(sys.argv[1])
+    if not p.exists():
+      print("summary_total_seconds=0")
+      print("processing_fps=0")
+      print("avg_det_ms=0")
+      print("avg_pose_ms=0")
+      print("avg_id_ms=0")
+      print("total_detections=0")
+      print("frames_processed=0")
+      raise SystemExit(0)
+
+    text = p.read_text()
+
+    def grab(rx, default="0"):
+      m = re.search(rx, text, re.MULTILINE)
+      return m.group(1).strip() if m else default
+
+    print("summary_total_seconds=" + grab(r"^total_time:\\s+.*\\(([-0-9.]+)s\\)$"))
+    print("processing_fps=" + grab(r"^processing_fps:\\s+([-0-9.]+)$"))
+    print("avg_det_ms=" + grab(r"^avg_det_ms:\\s+([-0-9.]+)$"))
+    print("avg_pose_ms=" + grab(r"^avg_pose_ms:\\s+([-0-9.]+)$"))
+    print("avg_id_ms=" + grab(r"^avg_id_ms:\\s+([-0-9.]+)$"))
+    print("total_detections=" + grab(r"^total_detections:\\s+(\\d+)$"))
+    print("frames_processed=" + grab(r"^frames_processed:\\s+(\\d+)$"))
+    PY
+  register: parsed_summary
+  changed_when: false
+
+- name: Materialize parsed metrics
+  set_fact:
+    summary_total_seconds: "{{ (parsed_summary.stdout | regex_search('summary_total_seconds=([-0-9.]+)', '\\1')) | default('0') }}"
+    processing_fps: "{{ (parsed_summary.stdout | regex_search('processing_fps=([-0-9.]+)', '\\1')) | default('0') }}"
+    avg_det_ms: "{{ (parsed_summary.stdout | regex_search('avg_det_ms=([-0-9.]+)', '\\1')) | default('0') }}"
+    avg_pose_ms: "{{ (parsed_summary.stdout | regex_search('avg_pose_ms=([-0-9.]+)', '\\1')) | default('0') }}"
+    avg_id_ms: "{{ (parsed_summary.stdout | regex_search('avg_id_ms=([-0-9.]+)', '\\1')) | default('0') }}"
+    total_detections: "{{ (parsed_summary.stdout | regex_search('total_detections=(\\d+)', '\\1')) | default('0') }}"
+    frames_processed: "{{ (parsed_summary.stdout | regex_search('frames_processed=(\\d+)', '\\1')) | default('0') }}"
+    run_status: "{{ 'ok' if (pipeline_timing.rc | default(1)) == 0 else 'failed' }}"
+
+- name: Write per-video timing text report
+  delegate_to: localhost
+  copy:
+    dest: "{{ _local_timing_txt }}"
+    content: |
+      host: {{ inventory_hostname }}
+      video_name: {{ _video_name }}
+      video_path: {{ _video_src }}
+      view: {{ synth_item.view }}
+      monkey_count: {{ synth_item.monkey_count }}
+      duration_h: {{ synth_item.duration_h }}
+      copy_seconds: {{ copy_timing.stdout | trim }}
+      pipeline_wall_seconds: {{ pipeline_timing.stdout | default('0') | trim }}
+      summary_total_seconds: {{ summary_total_seconds }}
+      processing_fps: {{ processing_fps }}
+      avg_det_ms: {{ avg_det_ms }}
+      avg_pose_ms: {{ avg_pose_ms }}
+      avg_id_ms: {{ avg_id_ms }}
+      total_detections: {{ total_detections }}
+      frames_processed: {{ frames_processed }}
+      status: {{ run_status }}
+
+- name: Write per-video timing JSON report
+  delegate_to: localhost
+  copy:
+    dest: "{{ _local_timing_json }}"
+    content: |
+      {
+        "host": "{{ inventory_hostname }}",
+        "video_name": "{{ _video_name }}",
+        "video_path": "{{ _video_src }}",
+        "view": "{{ synth_item.view }}",
+        "monkey_count": {{ synth_item.monkey_count }},
+        "duration_h": {{ synth_item.duration_h }},
+        "copy_seconds": {{ copy_timing.stdout | trim }},
+        "pipeline_wall_seconds": {{ pipeline_timing.stdout | default('0') | trim }},
+        "summary_total_seconds": {{ summary_total_seconds }},
+        "processing_fps": {{ processing_fps }},
+        "avg_det_ms": {{ avg_det_ms }},
+        "avg_pose_ms": {{ avg_pose_ms }},
+        "avg_id_ms": {{ avg_id_ms }},
+        "total_detections": {{ total_detections }},
+        "frames_processed": {{ frames_processed }},
+        "status": "{{ run_status }}"
+      }

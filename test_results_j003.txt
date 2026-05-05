@@ -1,0 +1,38 @@
+j003
+============================================================
+Loading frame: /home/nvidia/test_frame/test_frame_m10.png
+Frame size: 2048×1500
+
+Loading models...
+✓ RT-DETR TRT loaded: /home/nvidia/JetsonDistributedComp/converted_models/RT-DETR_640.engine
+✓ RTMPose and ID models loaded
+
+============================================================
+DETECTION TEST
+============================================================
+Detections: 0
+Detection time: 129.9 ms
+
+⚠ TRT engine returned 0 detections - trying PyTorch fallback...
+PyTorch detections: 10
+PyTorch detection time: 3452.4 ms
+
+============================================================
+POSE + ID TEST (first 3 detections)
+============================================================
+
+Detection 1: bbox=(101,187,439,549) conf=0.911
+  RTMPose: 17/17 valid keypoints, 9.7 ms
+  ID Model: Elm (conf=0.731), 28.7 ms
+
+Detection 2: bbox=(646,221,918,510) conf=0.901
+  RTMPose: 17/17 valid keypoints, 9.0 ms
+  ID Model: Elm (conf=0.731), 24.1 ms
+
+Detection 3: bbox=(637,636,922,947) conf=0.910
+  RTMPose: 17/17 valid keypoints, 9.2 ms
+  ID Model: Elm (conf=0.731), 24.2 ms
+
+============================================================
+✓ Test complete - models working!
+============================================================
